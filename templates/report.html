@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}P&L Report - FinParse{% endblock %}
+
+{% block content %}
+<div class="mb-8 flex justify-between items-end border-b border-gray-200 pb-4">
+    <div>
+        <h1 class="text-2xl font-bold text-gray-900 mb-1">Financial P&L Report</h1>
+        <p class="text-gray-500 text-sm">Source File: <span class="text-gray-800 font-medium">{{ filename }}</span></p>
+    </div>
+    <div class="flex space-x-3">
+        <a href="/download/{{ export_filename }}" class="text-white bg-gray-900 hover:bg-gray-800 px-4 py-2 rounded-md text-sm font-medium transition-colors border border-transparent shadow-sm flex items-center">
+            <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+            Export Excel
+        </a>
+        <a href="/" class="text-gray-600 hover:text-gray-900 bg-white hover:bg-gray-50 px-4 py-2 rounded-md text-sm font-medium transition-colors border border-gray-300 shadow-sm flex items-center">
+            Upload New
+        </a>
+    </div>
+</div>
+
+<!-- Summary Cards -->
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+    <div class="card p-6 border-l-4 border-l-blue-600">
+        <h3 class="text-gray-500 text-xs font-semibold uppercase tracking-wider mb-1">Total Revenue</h3>
+        <p class="text-3xl font-bold text-gray-900">${{ "{:,.2f}".format(data.summary.total_revenue) }}</p>
+    </div>
+    <div class="card p-6 border-l-4 border-l-orange-500">
+        <h3 class="text-gray-500 text-xs font-semibold uppercase tracking-wider mb-1">Total COGS</h3>
+        <p class="text-3xl font-bold text-gray-900">${{ "{:,.2f}".format(data.summary.total_cogs) }}</p>
+    </div>
+    <div class="card p-6 border-l-4 border-l-green-600">
+        <h3 class="text-gray-500 text-xs font-semibold uppercase tracking-wider mb-1">Gross Profit</h3>
+        <p class="text-3xl font-bold text-green-700">${{ "{:,.2f}".format(data.summary.total_gross_profit) }}</p>
+    </div>
+</div>
+
+<!-- Vertical Breakdowns -->
+<h2 class="text-lg font-bold text-gray-900 mb-4 uppercase tracking-wide">Business Verticals</h2>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    {% for vertical, v_data in data.verticals.items() %}
+    <div class="card overflow-hidden">
+        <div class="bg-gray-50 px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+            <h3 class="text-lg font-bold text-gray-900">{{ vertical }}</h3>
+            <span class="px-2.5 py-1 text-xs font-bold rounded-md {% if v_data.net_profit >= 0 %}bg-green-100 text-green-800{% else %}bg-red-100 text-red-800{% endif %}">
+                Net: ${{ "{:,.2f}".format(v_data.net_profit) }}
+            </span>
+        </div>
+        
+        <div class="p-6">
+            <table class="w-full text-left border-collapse text-sm">
+                <tbody>
+                    <tr class="border-b border-gray-100">
+                        <td class="py-3 text-gray-600 font-medium">Revenue</td>
+                        <td class="py-3 text-right font-semibold text-gray-900">${{ "{:,.2f}".format(v_data.revenue) }}</td>
+                    </tr>
+                    
+                    <!-- COGS Breakdown -->
+                    <tr class="border-b border-gray-100 bg-gray-50/50">
+                        <td class="py-2.5 pl-4 text-gray-500 text-xs">↳ Opening Stock</td>
+                        <td class="py-2.5 text-right text-xs text-gray-500">${{ "{:,.2f}".format(v_data.details.opening_stock) }}</td>
+                    </tr>
+                    <tr class="border-b border-gray-100 bg-gray-50/50">
+                        <td class="py-2.5 pl-4 text-gray-500 text-xs">↳ Purchases</td>
+                        <td class="py-2.5 text-right text-xs text-gray-500">${{ "{:,.2f}".format(v_data.details.purchases) }}</td>
+                    </tr>
+                    <tr class="border-b border-gray-100 bg-gray-50/50">
+                        <td class="py-2.5 pl-4 text-gray-500 text-xs">↳ Less: Closing Stock</td>
+                        <td class="py-2.5 text-right text-xs text-gray-500">(${{ "{:,.2f}".format(v_data.details.closing_stock) }})</td>
+                    </tr>
+                    
+                    <tr class="border-b border-gray-200">
+                        <td class="py-3 font-medium text-gray-600">Cost of Goods Sold</td>
+                        <td class="py-3 text-right font-medium text-gray-900">(${{ "{:,.2f}".format(v_data.cogs) }})</td>
+                    </tr>
+                    
+                    <tr class="border-b border-gray-200 bg-gray-50">
+                        <td class="py-4 font-bold text-gray-900">Gross Profit</td>
+                        <td class="py-4 text-right font-bold text-gray-900">${{ "{:,.2f}".format(v_data.gross_profit) }}</td>
+                    </tr>
+                    
+                    <tr class="border-b border-gray-200">
+                        <td class="py-3 text-gray-600">Indirect Expenses</td>
+                        <td class="py-3 text-right font-medium text-gray-900">(${{ "{:,.2f}".format(v_data.indirect_expenses) }})</td>
+                    </tr>
+                    
+                    <tr>
+                        <td class="py-4 font-bold text-gray-900 text-base">Net Profit</td>
+                        <td class="py-4 text-right font-bold text-base {% if v_data.net_profit >= 0 %}text-green-600{% else %}text-red-600{% endif %}">
+                            ${{ "{:,.2f}".format(v_data.net_profit) }}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}
