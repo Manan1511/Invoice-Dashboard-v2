@@ -1,345 +1,500 @@
+"""
+parser.py – Financial MIS parser.
+
+Extracts CM and YTD P&L data from an MIS Excel workbook that contains:
+  • List of Ledgers  – ledger master with classification & business vertical
+  • TB               – current-month trial balance
+  • TB YTD           – year-to-date trial balance
+  • Stock            – stock movement (split into CM & YTD sections by marker row)
+"""
+
 import io
+import re
+import datetime
 import pandas as pd
 import numpy as np
-import datetime
 from core.validation import validate_sheets_exist, validate_trial_balance, FinancialValidationError
 
-def get_header_row(df, keyword):
-    for i in range(min(15, len(df))):
-        row_values = df.iloc[i].astype(str).str.lower()
-        if any(keyword.lower() in str(val) for val in row_values):
-            df.columns = df.iloc[i]
-            df = df.iloc[i+1:].reset_index(drop=True)
-            df.columns = df.columns.astype(str).str.strip()
-            return df
-    df.columns = df.columns.astype(str).str.strip()
-    return df
 
-def get_col(df, possible_names):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_header_row(df: pd.DataFrame, keyword: str) -> int:
+    """Return the 0-based index of the first row that contains *keyword*."""
+    for i in range(min(20, len(df))):
+        if any(keyword.lower() in str(v).lower() for v in df.iloc[i]):
+            return i
+    return 0
+
+
+def _read_with_header(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
+    """Promote the first row containing *keyword* to column headers."""
+    hdr = _find_header_row(df, keyword)
+    out = df.iloc[hdr:].copy()
+    out.columns = out.iloc[0].astype(str).str.strip()
+    out = out.iloc[1:].reset_index(drop=True)
+    return out
+
+
+def _get_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return the first column name that matches any candidate (case-insensitive)."""
     for col in df.columns:
-        for name in possible_names:
-            if name.lower() in col.lower():
+        col_str = str(col).strip()
+        for cand in candidates:
+            if cand.lower() in col_str.lower():
                 return col
     return None
 
-def parse_financial_excel(file_bytes: bytes, company_name: str = "Pristine Worldwide Private Limited", report_month: str = "2025-06") -> dict:
+
+def _to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors='coerce').fillna(0)
+
+
+# ---------------------------------------------------------------------------
+# Stock sheet parser
+# ---------------------------------------------------------------------------
+
+def _parse_stock(raw: pd.DataFrame, report_month: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split the Stock sheet into YTD and CM DataFrames.
+
+    The sheet layout is:
+        [header row] [YTD rows] [Total] [blank] [marker row with month/YTD label]
+        [header row] [CM rows]  [Total]
+
+    We detect the second header block by looking for a row whose first non-null
+    cell contains the report-month string (e.g. "Mar'26") or "April to".
+    """
+    # Build a searchable string for the marker (e.g. "Mar'26")
+    try:
+        dt = datetime.datetime.strptime(report_month, "%Y-%m")
+        short_month = dt.strftime("%b")          # "Mar"
+        short_year  = dt.strftime("%y")          # "26"
+        month_marker = f"{short_month}'{short_year}"   # "Mar'26"
+    except ValueError:
+        month_marker = ""
+
+    # Find the row that acts as the separator between YTD block and CM block
+    split_idx = None
+    for i, row in raw.iterrows():
+        row_str = " ".join(str(v) for v in row if pd.notna(v))
+        if (month_marker and month_marker.lower() in row_str.lower()) or \
+           ("april to" in row_str.lower()):
+            split_idx = i
+            break
+
+    if split_idx is None:
+        # Fallback: treat all as CM
+        cm_raw  = raw
+        ytd_raw = raw
+    else:
+        ytd_raw = raw.iloc[:split_idx]
+        cm_raw  = raw.iloc[split_idx:]
+
+    def _extract_section(section: pd.DataFrame) -> pd.DataFrame:
+        hdr = _find_header_row(section.reset_index(drop=True), "Business Vert")
+        sec = section.reset_index(drop=True).iloc[hdr:]
+        sec.columns = sec.iloc[0].astype(str).str.strip()
+        sec = sec.iloc[1:].reset_index(drop=True)
+
+        # Normalise column names
+        vert_col = _get_col(sec, ["business vert", "vertical", "verticle"])
+        open_col = _get_col(sec, ["opening"])
+        inwd_col = _get_col(sec, ["inward", "purchase"])
+        outw_col = _get_col(sec, ["outward", "sales"])
+        clos_col = _get_col(sec, ["closing"])
+
+        rename = {}
+        if vert_col: rename[vert_col] = "Business Vertical"
+        if open_col: rename[open_col] = "Opening Stock"
+        if inwd_col: rename[inwd_col] = "Purchases"
+        if clos_col: rename[clos_col] = "Closing Stock"
+        sec.rename(columns=rename, inplace=True)
+
+        if "Business Vertical" not in sec.columns:
+            return pd.DataFrame()
+
+        sec = sec[sec["Business Vertical"].notna()].copy()
+        sec = sec[~sec["Business Vertical"].astype(str).str.lower().isin(["total", "nan", ""])]
+        sec["Business Vertical"] = sec["Business Vertical"].astype(str).str.strip().str.title()
+
+        for col in ["Opening Stock", "Purchases", "Closing Stock"]:
+            if col in sec.columns:
+                sec[col] = _to_num(sec[col])
+
+        keep = [c for c in ["Business Vertical", "Opening Stock", "Purchases", "Closing Stock"] if c in sec.columns]
+        return sec[keep].groupby("Business Vertical", as_index=False).sum()
+
+    return _extract_section(cm_raw), _extract_section(ytd_raw)
+
+
+# ---------------------------------------------------------------------------
+# Main parser
+# ---------------------------------------------------------------------------
+
+def parse_financial_excel(
+    file_bytes: bytes,
+    company_name: str = "Pristine Worldwide Private Limited",
+    report_month: str = "2025-06",
+) -> dict:
     try:
         excel_file = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = excel_file.sheet_names
-        
-        required_sheets = ["List of Ledgers", "TB", "Stock"]
-        mapped_sheets = validate_sheets_exist(sheet_names, required_sheets)
-        
-        ledgers_df = pd.read_excel(excel_file, sheet_name=mapped_sheets["List of Ledgers"], header=None)
-        tb_df = pd.read_excel(excel_file, sheet_name=mapped_sheets["TB"], header=None)
-        stock_df = pd.read_excel(excel_file, sheet_name=mapped_sheets["Stock"], header=None)
-        
-        ledgers_df = get_header_row(ledgers_df, "Name of Ledger")
-        tb_df = get_header_row(tb_df, "Debit")
-        stock_df = get_header_row(stock_df, "Opening")
-        
-        # Rename columns to standardized names for internal use
-        tb_debit_col = get_col(tb_df, ["debit"])
-        tb_credit_col = get_col(tb_df, ["credit"])
-        
-        if tb_debit_col and tb_debit_col != 'Debit':
-            # Handle duplicate column names by dropping the existing 'Debit' if it exists
-            if 'Debit' in tb_df.columns:
-                tb_df = tb_df.loc[:, ~tb_df.columns.duplicated()]
-                tb_df = tb_df.drop(columns=['Debit'])
-            tb_df.rename(columns={tb_debit_col: 'Debit'}, inplace=True)
-            
-        if tb_credit_col and tb_credit_col != 'Credit':
-            if 'Credit' in tb_df.columns:
-                tb_df = tb_df.loc[:, ~tb_df.columns.duplicated()]
-                tb_df = tb_df.drop(columns=['Credit'])
-            tb_df.rename(columns={tb_credit_col: 'Credit'}, inplace=True)
-            
-        validate_trial_balance(tb_df)
-        
-        # Determine Ledger columns
-        ledger_name_col = get_col(ledgers_df, ["name of ledger", "ledger name"])
-        vertical_col = get_col(ledgers_df, ["business vertical", "vertical"])
-        group_col = get_col(ledgers_df, ["group"])
-        head_col = get_col(ledgers_df, ["head"])
-        
+
+        required = ["List of Ledgers", "TB", "TB YTD", "Stock"]
+        mapped   = validate_sheets_exist(sheet_names, required)
+
+        # ------------------------------------------------------------------ #
+        # 1.  Read raw sheets                                                 #
+        # ------------------------------------------------------------------ #
+        ledgers_raw  = pd.read_excel(excel_file, sheet_name=mapped["List of Ledgers"], header=None)
+        tb_cm_raw    = pd.read_excel(excel_file, sheet_name=mapped["TB"],     header=None)
+        tb_ytd_raw   = pd.read_excel(excel_file, sheet_name=mapped["TB YTD"], header=None)
+        stock_raw    = pd.read_excel(excel_file, sheet_name=mapped["Stock"],  header=None)
+
+        # ------------------------------------------------------------------ #
+        # 2.  Parse Ledger master                                             #
+        # ------------------------------------------------------------------ #
+        ledgers = _read_with_header(ledgers_raw, "Name of Ledger")
+        ledger_name_col = _get_col(ledgers, ["name of ledger", "ledger name"])
+        vertical_col    = _get_col(ledgers, ["business vertical", "vertical"])
+        group_col       = _get_col(ledgers, ["group"])
+        head_col        = _get_col(ledgers, ["head"])
+
         if not ledger_name_col or not vertical_col:
             raise FinancialValidationError(
                 title="Invalid Ledgers Format",
-                message="The 'List of Ledgers' sheet must contain Ledger Name and Business Vertical columns.",
+                message="'List of Ledgers' must have 'Name of Ledger' and 'Business Vertical' columns.",
             )
-            
-        rename_dict = {
-            ledger_name_col: 'Ledger Name',
-            vertical_col: 'Business Vertical',
-        }
-        if group_col: rename_dict[group_col] = 'Group'
-        if head_col: rename_dict[head_col] = 'Head'
-            
-        ledgers_df.rename(columns=rename_dict, inplace=True)
-        
-        # Drop rows where Ledger Name is empty or whitespace
-        ledgers_df = ledgers_df.dropna(subset=['Ledger Name'])
-        ledgers_df = ledgers_df[ledgers_df['Ledger Name'].astype(str).str.strip() != '']
-        
-        # Combine Group and Head for classification
-        if 'Group' not in ledgers_df.columns: ledgers_df['Group'] = ''
-        if 'Head' not in ledgers_df.columns: ledgers_df['Head'] = ''
-        ledgers_df['Classification'] = ledgers_df['Group'].astype(str) + " " + ledgers_df['Head'].astype(str)
-        
-        # Gracefully handle missing Business Verticals by assigning them to 'Unallocated'
-        ledgers_df['Business Vertical'] = ledgers_df['Business Vertical'].fillna('Unallocated')
-        
-        # Normalize essential column names if present
-        if "Name of Ledger" in ledgers_df.columns:
-            ledgers_df.rename(columns={"Name of Ledger": "Ledger Name"}, inplace=True)
-            
-        tb_ledger_col = get_col(tb_df, ["particulars", "ledger"])
-        if tb_ledger_col:
-            tb_df.rename(columns={tb_ledger_col: "Ledger Name"}, inplace=True)
+
+        rename = {ledger_name_col: "Ledger Name", vertical_col: "Business Vertical"}
+        if group_col: rename[group_col] = "Group"
+        if head_col:  rename[head_col]  = "Head"
+        ledgers.rename(columns=rename, inplace=True)
+
+        if "Group" not in ledgers.columns: ledgers["Group"] = ""
+        if "Head"  not in ledgers.columns: ledgers["Head"]  = ""
+        ledgers["Classification"] = (
+            ledgers["Group"].astype(str) + " " + ledgers["Head"].astype(str)
+        )
+        ledgers = ledgers.dropna(subset=["Ledger Name"])
+        ledgers = ledgers[ledgers["Ledger Name"].astype(str).str.strip() != ""]
+        ledgers["Business Vertical"] = (
+            ledgers["Business Vertical"].fillna("Unallocated")
+            .astype(str).str.strip().str.title()
+        )
+
+        # ------------------------------------------------------------------ #
+        # 3.  Parse CM Trial Balance                                          #
+        # ------------------------------------------------------------------ #
+        tb_cm = _read_with_header(tb_cm_raw, "Particulars")
+
+        # Normalise: keep only the "Debit / Credit" columns (not "Debit Bal" etc.)
+        # The TB sheet has: Opening Bal | Debit Bal | Credit Bal | Closing Bal | gap |
+        #                   Opening     | Debit     | Credit     | Closing
+        # We want the second set (Opening, Debit, Credit, Closing).
+        part_col = _get_col(tb_cm, ["particulars", "ledger"])
+        if not part_col:
+            tb_cm.columns.values[0] = "Ledger Name"
         else:
-            tb_df.rename(columns={tb_df.columns[0]: "Ledger Name"}, inplace=True)
-            
-        # Create Classification group
-        ledgers_df['Classification'] = ledgers_df['Group'].astype(str) + ' ' + ledgers_df['Head'].astype(str)
-        
-        # Merge TB with Ledgers to map classifications, verticals, AND grab YTD columns!
-        ytd_cols = []
-        if 'Opening YTD' in ledgers_df.columns: ytd_cols.extend(['Opening YTD', 'Debit YTD', 'Credit YTD', 'Closing YTD'])
-        merge_cols = ['Ledger Name', 'Business Vertical', 'Classification'] + ytd_cols
-        
-        merged_tb = pd.merge(tb_df, ledgers_df[[c for c in merge_cols if c in ledgers_df.columns]], on='Ledger Name', how='left')
-        
-        merged_tb['Net Balance'] = pd.to_numeric(merged_tb['Credit'], errors='coerce').fillna(0) - pd.to_numeric(merged_tb['Debit'], errors='coerce').fillna(0)
-        if 'Credit YTD' in merged_tb.columns:
-            merged_tb['YTD Net Balance'] = pd.to_numeric(merged_tb['Credit YTD'], errors='coerce').fillna(0) - pd.to_numeric(merged_tb['Debit YTD'], errors='coerce').fillna(0)
+            tb_cm.rename(columns={part_col: "Ledger Name"}, inplace=True)
+
+        # Find the exact "Debit" and "Credit" columns (not "Debit Bal")
+        debit_col  = None
+        credit_col = None
+        open_col   = None
+        close_col  = None
+        for col in tb_cm.columns:
+            cs = str(col).strip()
+            if cs == "Debit":   debit_col  = col
+            if cs == "Credit":  credit_col = col
+            if cs == "Opening": open_col   = col
+            if cs == "Closing": close_col  = col
+
+        # Fallback: "Debit Bal" → "Debit", "Credit Bal" → "Credit" etc.
+        if not debit_col:
+            debit_col  = _get_col(tb_cm, ["debit"])
+        if not credit_col:
+            credit_col = _get_col(tb_cm, ["credit"])
+        if not open_col:
+            open_col   = _get_col(tb_cm, ["opening"])
+        if not close_col:
+            close_col  = _get_col(tb_cm, ["closing"])
+
+        tb_cm_clean = tb_cm[["Ledger Name"]].copy()
+        if open_col:   tb_cm_clean["Opening"] = _to_num(tb_cm[open_col])
+        if debit_col:  tb_cm_clean["Debit"]   = _to_num(tb_cm[debit_col])
+        if credit_col: tb_cm_clean["Credit"]  = _to_num(tb_cm[credit_col])
+        if close_col:  tb_cm_clean["Closing"] = _to_num(tb_cm[close_col])
+
+        validate_trial_balance(tb_cm_clean)
+
+        # ------------------------------------------------------------------ #
+        # 4.  Parse YTD Trial Balance                                         #
+        # ------------------------------------------------------------------ #
+        tb_ytd = _read_with_header(tb_ytd_raw, "Particulars")
+
+        part_col_y = _get_col(tb_ytd, ["particulars", "ledger"])
+        if not part_col_y:
+            tb_ytd.columns.values[0] = "Ledger Name"
         else:
-            merged_tb['YTD Net Balance'] = 0
-            
-        # Normalize verticals (capitalize properly, e.g. 'common' -> 'Common')
-        ledgers_df['Business Vertical'] = ledgers_df['Business Vertical'].astype(str).str.strip().str.title()
-        merged_tb['Business Vertical'] = merged_tb['Business Vertical'].astype(str).str.strip().str.title()
-        
-        # Preserve the exact order verticals first appear in the List of Ledgers sheet
-        seen = set()
-        vertical_order = []
-        for v in ledgers_df['Business Vertical']:
-            v = str(v).strip()
-            if pd.notna(v) and v != '' and v != 'Nan' and v not in seen:
+            tb_ytd.rename(columns={part_col_y: "Ledger Name"}, inplace=True)
+
+        # YTD sheet has: Opening | Debit | Credit | Closing | gap |
+        #                Opening YTD | Debit YTD | Credit YTD | Closing YTD
+        # We want the YTD columns (the second set).
+        ytd_debit  = _get_col(tb_ytd, ["debit ytd"])
+        ytd_credit = _get_col(tb_ytd, ["credit ytd"])
+        ytd_open   = _get_col(tb_ytd, ["opening ytd"])
+        ytd_close  = _get_col(tb_ytd, ["closing ytd"])
+
+        # Fallback to first Debit/Credit if YTD columns absent
+        if not ytd_debit:  ytd_debit  = _get_col(tb_ytd, ["debit"])
+        if not ytd_credit: ytd_credit = _get_col(tb_ytd, ["credit"])
+        if not ytd_open:   ytd_open   = _get_col(tb_ytd, ["opening"])
+        if not ytd_close:  ytd_close  = _get_col(tb_ytd, ["closing"])
+
+        tb_ytd_clean = tb_ytd[["Ledger Name"]].copy()
+        if ytd_open:   tb_ytd_clean["Opening YTD"]  = _to_num(tb_ytd[ytd_open])
+        if ytd_debit:  tb_ytd_clean["Debit YTD"]    = _to_num(tb_ytd[ytd_debit])
+        if ytd_credit: tb_ytd_clean["Credit YTD"]   = _to_num(tb_ytd[ytd_credit])
+        if ytd_close:  tb_ytd_clean["Closing YTD"]  = _to_num(tb_ytd[ytd_close])
+
+        # ------------------------------------------------------------------ #
+        # 5.  Merge: CM TB ←→ YTD TB ←→ Ledger master                       #
+        # ------------------------------------------------------------------ #
+        merged = pd.merge(tb_cm_clean, tb_ytd_clean, on="Ledger Name", how="outer")
+
+        ledger_cols = ["Ledger Name", "Business Vertical", "Classification"]
+        merged = pd.merge(
+            merged,
+            ledgers[ledger_cols].drop_duplicates(subset=["Ledger Name"]),
+            on="Ledger Name",
+            how="left",
+        )
+
+        # Fill defaults
+        for col in ["Debit", "Credit", "Opening", "Closing",
+                    "Debit YTD", "Credit YTD", "Opening YTD", "Closing YTD"]:
+            if col not in merged.columns:
+                merged[col] = 0.0
+            else:
+                merged[col] = _to_num(merged[col])
+
+        merged["Business Vertical"] = (
+            merged["Business Vertical"].fillna("Unallocated")
+            .astype(str).str.strip().str.title()
+        )
+        merged["Classification"] = merged["Classification"].fillna("").astype(str)
+
+        # Net Balance convention:
+        #   Sales accounts  → Credit > Debit → positive Net Balance = revenue
+        #   Expense/Purchase → Debit > Credit → we negate at point-of-use
+        merged["Net Balance"]     = merged["Credit"]     - merged["Debit"]
+        merged["Net Balance YTD"] = merged["Credit YTD"] - merged["Debit YTD"]
+
+        # ------------------------------------------------------------------ #
+        # 6.  Vertical order (from Ledger master, first-seen)                 #
+        # ------------------------------------------------------------------ #
+        seen: set[str] = set()
+        vertical_order: list[str] = []
+        for v in ledgers["Business Vertical"]:
+            if v not in seen:
                 seen.add(v)
                 vertical_order.append(v)
-        verticals = vertical_order
-        
-        # Helper to safely parse month string to get exact names
+
+        verticals = [v for v in vertical_order if v in merged["Business Vertical"].values]
+
+        # ------------------------------------------------------------------ #
+        # 7.  Month display strings                                           #
+        # ------------------------------------------------------------------ #
         try:
-            date_obj = datetime.datetime.strptime(report_month, "%Y-%m")
-            month_name = date_obj.strftime("%B")
-            year_name = date_obj.strftime("%Y")
-            report_month_display = f"{month_name} {year_name}"
-            # e.g., 'May 2025' -> YTD range 'April to May'
-            ytd_range = f"(April to {month_name})"
-        except:
-            report_month_display = report_month
-            ytd_range = "(YTD)"
-            
-        report_data = {
-            "company_name": company_name,
-            "report_month": report_month_display,
-            "ytd_range": ytd_range,
-            "vertical_order": vertical_order,  # natural order from List of Ledgers
-            "vertical_types": {},              # filled in per-vertical loop below
-            "verticals": {},
+            dt = datetime.datetime.strptime(report_month, "%Y-%m")
+            month_name         = dt.strftime("%B")
+            year_name          = dt.strftime("%Y")
+            report_month_disp  = f"{month_name} {year_name}"
+            ytd_range          = f"(April to {month_name})"
+        except ValueError:
+            report_month_disp  = report_month
+            ytd_range          = "(YTD)"
+
+        # ------------------------------------------------------------------ #
+        # 8.  Parse Stock sheet                                               #
+        # ------------------------------------------------------------------ #
+        stock_cm, stock_ytd = _parse_stock(stock_raw, report_month)
+
+        # ------------------------------------------------------------------ #
+        # 9.  Build report_data                                               #
+        # ------------------------------------------------------------------ #
+        report_data: dict = {
+            "company_name":   company_name,
+            "report_month":   report_month_disp,
+            "ytd_range":      ytd_range,
+            "vertical_order": vertical_order,
+            "vertical_types": {},
+            "verticals":      {},
             "summary": {
-                "total_revenue": 0,
-                "total_cogs": 0,
-                "total_gross_profit": 0
+                "total_revenue":      0.0,
+                "total_cogs":         0.0,
+                "total_gross_profit": 0.0,
             },
-            "raw_summary": {
-                "total_rows": len(merged_tb)
-            }
         }
-        
-        # Stock headers mapping
-        stock_vert_col = get_col(stock_df, ["vertical", "verticle"])
-        if stock_vert_col: stock_df.rename(columns={stock_vert_col: 'Business Vertical'}, inplace=True)
-        
-        stock_opening_col = get_col(stock_df, ["opening"])
-        stock_closing_col = get_col(stock_df, ["closing"])
-        stock_purchases_col = get_col(stock_df, ["inward", "purchase"])
-        
-        if stock_opening_col: stock_df.rename(columns={stock_opening_col: 'Opening Stock'}, inplace=True)
-        if stock_closing_col: stock_df.rename(columns={stock_closing_col: 'Closing Stock'}, inplace=True)
-        if stock_purchases_col: stock_df.rename(columns={stock_purchases_col: 'Purchases'}, inplace=True)
-        
-        # The stock sheet has YTD totals (top) and Current Month totals (bottom). 
-        if 'Business Vertical' in stock_df.columns:
-            stock_df['Business Vertical'] = stock_df['Business Vertical'].astype(str).str.strip().str.title()
-            stock_df_cm = stock_df.drop_duplicates(subset=['Business Vertical'], keep='last')
-            stock_df_ytd = stock_df.drop_duplicates(subset=['Business Vertical'], keep='first')
-        else:
-            stock_df_cm = pd.DataFrame()
-            stock_df_ytd = pd.DataFrame()
-            
+
+        # ------------------------------------------------------------------ #
+        # 10. Per-vertical calculations                                       #
+        # ------------------------------------------------------------------ #
         for vertical in verticals:
-            v_data = merged_tb[merged_tb['Business Vertical'] == vertical]
-            
-            # Helper to get sum safely
-            def sum_col(df, col_name):
-                if col_name in df.columns:
-                    return pd.to_numeric(df[col_name], errors='coerce').fillna(0).sum()
-                return 0
-                
-            # Current Month calculations
-            sales_data = v_data[v_data['Classification'].astype(str).str.contains('Sales', case=False, na=False)]
-            revenue = sales_data['Net Balance'].sum()
-            
-            purchases_data = v_data[v_data['Classification'].astype(str).str.contains('Purchase', case=False, na=False)]
-            tb_purchases = -purchases_data['Net Balance'].sum()
-            
-            v_stock_cm = stock_df_cm[stock_df_cm['Business Vertical'] == vertical] if not stock_df_cm.empty else pd.DataFrame()
-            opening_stock = pd.to_numeric(v_stock_cm['Opening Stock'], errors='coerce').sum() if 'Opening Stock' in v_stock_cm.columns else 0
-            closing_stock = pd.to_numeric(v_stock_cm['Closing Stock'], errors='coerce').sum() if 'Closing Stock' in v_stock_cm.columns else 0
-            stock_purchases = pd.to_numeric(v_stock_cm['Purchases'], errors='coerce').sum() if 'Purchases' in v_stock_cm.columns else 0
-            
-            purchases = tb_purchases if tb_purchases != 0 else stock_purchases
-            cogs = opening_stock + purchases - closing_stock
-            # Direct Expenses
-            direct_data = v_data[v_data['Classification'].astype(str).str.contains('Direct', case=False, na=False)]
-            direct_data = direct_data[~direct_data['Classification'].astype(str).str.contains('Indirect', case=False, na=False)]
-            direct_expenses = -direct_data['Net Balance'].sum()
-            direct_breakdown = {}
-            for _, row in direct_data.iterrows():
-                val = -float(row['Net Balance'])
-                if val != 0: direct_breakdown[row['Ledger Name']] = val
-            
-            gross_profit = revenue - cogs - direct_expenses
-            
-            indirect_inc_data = v_data[v_data['Classification'].astype(str).str.contains('Indirect Income', case=False, na=False)]
-            indirect_income = indirect_inc_data['Net Balance'].sum()
-            
-            indirect_data = v_data[v_data['Classification'].astype(str).str.contains('Indirect|Expense|Factory|Office|Common', case=False, na=False)]
-            indirect_data = indirect_data[~indirect_data['Classification'].astype(str).str.contains('Indirect Income|Direct', case=False, na=False)]
-            
-            indirect_expenses = -indirect_data['Net Balance'].sum()
-            
-            indirect_breakdown = {}
-            for _, row in indirect_data.iterrows():
-                val = -float(row['Net Balance'])
-                if val != 0: indirect_breakdown[row['Ledger Name']] = val
-                    
-            income_breakdown = {}
-            for _, row in indirect_inc_data.iterrows():
-                val = float(row['Net Balance'])
-                if val != 0: income_breakdown[row['Ledger Name']] = val
-            
-            net_profit = gross_profit + indirect_income - indirect_expenses
-            
-            # YTD Calculations
-            ytd_revenue = sales_data['YTD Net Balance'].sum()
-            ytd_tb_purchases = -purchases_data['YTD Net Balance'].sum()
-            
-            v_stock_ytd = stock_df_ytd[stock_df_ytd['Business Vertical'] == vertical] if not stock_df_ytd.empty else pd.DataFrame()
-            ytd_opening_stock = pd.to_numeric(v_stock_ytd['Opening Stock'], errors='coerce').sum() if 'Opening Stock' in v_stock_ytd.columns else 0
-            ytd_closing_stock = pd.to_numeric(v_stock_ytd['Closing Stock'], errors='coerce').sum() if 'Closing Stock' in v_stock_ytd.columns else 0
-            ytd_stock_purchases = pd.to_numeric(v_stock_ytd['Purchases'], errors='coerce').sum() if 'Purchases' in v_stock_ytd.columns else 0
-            
-            ytd_purchases = ytd_tb_purchases if ytd_tb_purchases != 0 else ytd_stock_purchases
-            ytd_cogs = ytd_opening_stock + ytd_purchases - ytd_closing_stock
-            
-            ytd_direct_expenses = -direct_data['YTD Net Balance'].sum()
-            ytd_direct_breakdown = {}
-            for _, row in direct_data.iterrows():
-                val = -float(row['YTD Net Balance'])
-                if val != 0: ytd_direct_breakdown[row['Ledger Name']] = val
-                
+            vd = merged[merged["Business Vertical"] == vertical]
+
+            def _clf(pattern: str, exclude: str = "") -> pd.DataFrame:
+                mask = vd["Classification"].str.contains(pattern, case=False, na=False, regex=True)
+                if exclude:
+                    mask &= ~vd["Classification"].str.contains(exclude, case=False, na=False, regex=True)
+                return vd[mask]
+
+            # --- Sales (P&L 1. Sales Accounts) ---
+            sales_rows  = _clf(r"1\. Sales")
+            revenue     = sales_rows["Net Balance"].sum()        # credit accounts → positive
+            ytd_revenue = sales_rows["Net Balance YTD"].sum()
+
+            # --- Purchases (P&L 5. Purchase Accounts, debit-heavy → Net Balance negative) ---
+            purch_rows       = _clf(r"5\. Purchase")
+            tb_purchases     = -purch_rows["Net Balance"].sum()       # flip → positive
+            ytd_tb_purchases = -purch_rows["Net Balance YTD"].sum()
+
+            # --- Stock (CM) ---
+            v_stk_cm = stock_cm[stock_cm["Business Vertical"] == vertical] if not stock_cm.empty else pd.DataFrame()
+            opening_stock  = float(v_stk_cm["Opening Stock"].sum())  if "Opening Stock" in v_stk_cm.columns else 0.0
+            closing_stock  = float(v_stk_cm["Closing Stock"].sum())  if "Closing Stock" in v_stk_cm.columns else 0.0
+            stock_purch_cm = float(v_stk_cm["Purchases"].sum())      if "Purchases"     in v_stk_cm.columns else 0.0
+            purchases      = tb_purchases if tb_purchases != 0 else stock_purch_cm
+            cogs           = opening_stock + purchases - closing_stock
+
+            # --- Stock (YTD) ---
+            v_stk_ytd = stock_ytd[stock_ytd["Business Vertical"] == vertical] if not stock_ytd.empty else pd.DataFrame()
+            ytd_opening = float(v_stk_ytd["Opening Stock"].sum()) if "Opening Stock" in v_stk_ytd.columns else 0.0
+            ytd_closing = float(v_stk_ytd["Closing Stock"].sum()) if "Closing Stock" in v_stk_ytd.columns else 0.0
+            ytd_stk_pur = float(v_stk_ytd["Purchases"].sum())     if "Purchases"     in v_stk_ytd.columns else 0.0
+            ytd_purchases = ytd_tb_purchases if ytd_tb_purchases != 0 else ytd_stk_pur
+            ytd_cogs      = ytd_opening + ytd_purchases - ytd_closing
+
+            # --- Direct Expenses (P&L 3. Direct Expense) ---
+            dir_rows = _clf(r"3\. Direct")
+            direct_expenses     = -dir_rows["Net Balance"].sum()
+            ytd_direct_expenses = -dir_rows["Net Balance YTD"].sum()
+            direct_breakdown: dict[str, float] = {}
+            ytd_direct_breakdown: dict[str, float] = {}
+            for _, row in dir_rows.iterrows():
+                lname = str(row["Ledger Name"])
+                cm_val  = -float(row["Net Balance"])
+                ytd_val = -float(row["Net Balance YTD"])
+                if cm_val  != 0: direct_breakdown[lname]     = cm_val
+                if ytd_val != 0: ytd_direct_breakdown[lname] = ytd_val
+
+            gross_profit     = revenue     - cogs     - direct_expenses
             ytd_gross_profit = ytd_revenue - ytd_cogs - ytd_direct_expenses
-            
-            ytd_indirect_income = indirect_inc_data['YTD Net Balance'].sum()
-            ytd_indirect_expenses = -indirect_data['YTD Net Balance'].sum()
-            
-            ytd_indirect_breakdown = {}
-            for _, row in indirect_data.iterrows():
-                val = -float(row['YTD Net Balance'])
-                if val != 0: ytd_indirect_breakdown[row['Ledger Name']] = val
-                
+
+            # --- Indirect Income (P&L 2. Indirect Income) ---
+            inc_rows = _clf(r"2\. Indirect Income")
+            indirect_income     = inc_rows["Net Balance"].sum()
+            ytd_indirect_income = inc_rows["Net Balance YTD"].sum()
+            income_breakdown: dict[str, float] = {}
+            ytd_income_breakdown: dict[str, float] = {}
+            for _, row in inc_rows.iterrows():
+                lname = str(row["Ledger Name"])
+                cm_val  = float(row["Net Balance"])
+                ytd_val = float(row["Net Balance YTD"])
+                if cm_val  != 0: income_breakdown[lname]     = cm_val
+                if ytd_val != 0: ytd_income_breakdown[lname] = ytd_val
+
+            # --- Indirect Expenses (P&L 6. Indirect Expense) ---
+            ind_rows = _clf(r"6\. Indirect")
+            indirect_expenses     = -ind_rows["Net Balance"].sum()
+            ytd_indirect_expenses = -ind_rows["Net Balance YTD"].sum()
+            indirect_breakdown: dict[str, float] = {}
+            ytd_indirect_breakdown: dict[str, float] = {}
+            for _, row in ind_rows.iterrows():
+                lname = str(row["Ledger Name"])
+                cm_val  = -float(row["Net Balance"])
+                ytd_val = -float(row["Net Balance YTD"])
+                if cm_val  != 0: indirect_breakdown[lname]     = cm_val
+                if ytd_val != 0: ytd_indirect_breakdown[lname] = ytd_val
+
+            net_profit     = gross_profit     + indirect_income     - indirect_expenses
             ytd_net_profit = ytd_gross_profit + ytd_indirect_income - ytd_indirect_expenses
-            
-            debtors_data = v_data[v_data['Classification'].astype(str).str.contains('Sundry Debtor', case=False, na=False)]
-            creditors_data = v_data[v_data['Classification'].astype(str).str.contains('Sundry Creditor', case=False, na=False)]
-            
+
+            # --- Debtors / Creditors ---
+            def _balance_dict(rows: pd.DataFrame) -> dict:
+                def _s(col: str) -> float:
+                    return float(_to_num(rows[col]).sum()) if col in rows.columns else 0.0
+                return {
+                    "opening":     _s("Opening"),
+                    "debit":       _s("Debit"),
+                    "credit":      _s("Credit"),
+                    "closing":     _s("Closing"),
+                    "opening_ytd": _s("Opening YTD"),
+                    "debit_ytd":   _s("Debit YTD"),
+                    "credit_ytd":  _s("Credit YTD"),
+                    "closing_ytd": _s("Closing YTD"),
+                }
+
+            dr_rows = _clf(r"Sundry Debtor")
+            cr_rows = _clf(r"Sundry Creditor")
+
+            # --- Vertical type ---
+            has_revenue = any([revenue, cogs, direct_expenses, ytd_revenue, ytd_cogs, ytd_direct_expenses])
+            v_lower = vertical.lower()
+            if "share" in v_lower and "trading" in v_lower:
+                v_type = "share_trading"
+            elif not has_revenue:
+                v_type = "cost_center"
+            else:
+                v_type = "revenue"
+
+            report_data["vertical_types"][vertical] = v_type
             report_data["verticals"][vertical] = {
-                "revenue": float(revenue),
-                "cogs": float(cogs),
-                "direct_expenses": float(direct_expenses),
+                "revenue":          float(revenue),
+                "cogs":             float(cogs),
+                "direct_expenses":  float(direct_expenses),
                 "direct_breakdown": direct_breakdown,
-                "gross_profit": float(gross_profit),
-                "indirect_income": float(indirect_income),
-                "indirect_expenses": float(indirect_expenses),
-                "net_profit": float(net_profit),
-                "indirect_breakdown": indirect_breakdown,
+                "gross_profit":     float(gross_profit),
+                "indirect_income":  float(indirect_income),
                 "income_breakdown": income_breakdown,
+                "indirect_expenses":  float(indirect_expenses),
+                "indirect_breakdown": indirect_breakdown,
+                "net_profit":         float(net_profit),
                 "details": {
                     "opening_stock": float(opening_stock),
-                    "purchases": float(purchases),
-                    "closing_stock": float(closing_stock)
+                    "purchases":     float(purchases),
+                    "closing_stock": float(closing_stock),
                 },
-                "ytd_revenue": float(ytd_revenue),
-                "ytd_cogs": float(ytd_cogs),
-                "ytd_direct_expenses": float(ytd_direct_expenses),
-                "ytd_direct_breakdown": ytd_direct_breakdown,
-                "ytd_gross_profit": float(ytd_gross_profit),
-                "ytd_indirect_income": float(ytd_indirect_income),
-                "ytd_indirect_expenses": float(ytd_indirect_expenses),
-                "ytd_net_profit": float(ytd_net_profit),
-                "ytd_indirect_breakdown": ytd_indirect_breakdown,
-                "debtors": {
-                    "opening": float(sum_col(debtors_data, 'Opening')),
-                    "debit": float(sum_col(debtors_data, 'Debit')),
-                    "credit": float(sum_col(debtors_data, 'Credit')),
-                    "closing": float(sum_col(debtors_data, 'Closing')),
-                    "opening_ytd": float(sum_col(debtors_data, 'Opening YTD')),
-                    "debit_ytd": float(sum_col(debtors_data, 'Debit YTD')),
-                    "credit_ytd": float(sum_col(debtors_data, 'Credit YTD')),
-                    "closing_ytd": float(sum_col(debtors_data, 'Closing YTD'))
-                },
-                "creditors": {
-                    "opening": float(sum_col(creditors_data, 'Opening')),
-                    "debit": float(sum_col(creditors_data, 'Debit')),
-                    "credit": float(sum_col(creditors_data, 'Credit')),
-                    "closing": float(sum_col(creditors_data, 'Closing')),
-                    "opening_ytd": float(sum_col(creditors_data, 'Opening YTD')),
-                    "debit_ytd": float(sum_col(creditors_data, 'Debit YTD')),
-                    "credit_ytd": float(sum_col(creditors_data, 'Credit YTD')),
-                    "closing_ytd": float(sum_col(creditors_data, 'Closing YTD'))
-                }
+                # YTD
+                "ytd_revenue":             float(ytd_revenue),
+                "ytd_cogs":                float(ytd_cogs),
+                "ytd_direct_expenses":     float(ytd_direct_expenses),
+                "ytd_direct_breakdown":    ytd_direct_breakdown,
+                "ytd_gross_profit":        float(ytd_gross_profit),
+                "ytd_indirect_income":     float(ytd_indirect_income),
+                "ytd_income_breakdown":    ytd_income_breakdown,
+                "ytd_indirect_expenses":   float(ytd_indirect_expenses),
+                "ytd_indirect_breakdown":  ytd_indirect_breakdown,
+                "ytd_net_profit":          float(ytd_net_profit),
+                "debtors":   _balance_dict(dr_rows),
+                "creditors": _balance_dict(cr_rows),
             }
-            
-            # Classify the vertical so the generator needs zero hardcoded names.
-            # A vertical whose name contains 'share' + 'trading' is share_trading.
-            # A vertical with zero revenue AND zero cogs in BOTH CM and YTD is a cost_center.
-            # Everything else is a revenue-generating vertical.
-            v_lower = vertical.lower()
-            has_revenue = (revenue != 0 or cogs != 0 or direct_expenses != 0 or
-                           ytd_revenue != 0 or ytd_cogs != 0 or ytd_direct_expenses != 0)
-            if 'share' in v_lower and 'trading' in v_lower:
-                v_type = 'share_trading'
-            elif not has_revenue:
-                v_type = 'cost_center'
-            else:
-                v_type = 'revenue'
-            report_data["vertical_types"][vertical] = v_type
 
-            report_data["summary"]["total_revenue"] += revenue
-            report_data["summary"]["total_cogs"] += cogs
+            report_data["summary"]["total_revenue"]      += revenue
+            report_data["summary"]["total_cogs"]         += cogs
             report_data["summary"]["total_gross_profit"] += gross_profit
-            
+
         return report_data
-        
+
     except FinancialValidationError:
         raise
-    except Exception as e:
+    except Exception as exc:
         raise FinancialValidationError(
             title="Parsing Error",
             message="An error occurred while parsing the Excel file.",
-            details=[str(e)]
+            details=[str(exc)],
         )
