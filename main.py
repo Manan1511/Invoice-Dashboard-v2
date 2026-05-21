@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -18,13 +18,18 @@ async def get_upload_page(request: Request):
     return templates.TemplateResponse("upload.html", {"request": request})
 
 @app.post("/upload", response_class=HTMLResponse)
-async def upload_file(request: Request, file: UploadFile = File(...)):
+async def upload_file(
+    request: Request, 
+    file: UploadFile = File(...),
+    company_name: str = Form("Pristine Worldwide Private Limited"),
+    report_month: str = Form("2025-06")
+):
     try:
         # Read the file into memory
         contents = await file.read()
         
         # Parse the financial excel file
-        report_data = parse_financial_excel(contents)
+        report_data = parse_financial_excel(contents, company_name=company_name, report_month=report_month)
         
         # Generate downloadable excel report
         from core.excel_generator import generate_excel_report
