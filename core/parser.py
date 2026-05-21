@@ -75,12 +75,14 @@ def _parse_stock(raw: pd.DataFrame, report_month: str) -> tuple[pd.DataFrame, pd
     except ValueError:
         month_marker = ""
 
-    # Find the row that acts as the separator between YTD block and CM block
+    # Find the row that separates the YTD summary (top) from the CM detail (bottom).
+    # The CM section is always preceded by a row containing the short month label
+    # (e.g. "Mar'26"). We deliberately do NOT match "April to" because that label
+    # appears inside the YTD header area, not between the two sections.
     split_idx = None
     for i, row in raw.iterrows():
         row_str = " ".join(str(v) for v in row if pd.notna(v))
-        if (month_marker and month_marker.lower() in row_str.lower()) or \
-           ("april to" in row_str.lower()):
+        if month_marker and month_marker.lower() in row_str.lower():
             split_idx = i
             break
 
@@ -353,14 +355,14 @@ def parse_financial_excel(
                     mask &= ~vd["Classification"].str.contains(exclude, case=False, na=False, regex=True)
                 return vd[mask]
 
-            # --- Sales (P&L 1. Sales Accounts) ---
-            sales_rows  = _clf(r"1\. Sales")
+            # --- Sales (matches "1. Sales Accounts", "Sales Accounts", "Sales Account", etc.) ---
+            sales_rows  = _clf(r"Sales\s*Account")
             revenue     = sales_rows["Net Balance"].sum()        # credit accounts → positive
             ytd_revenue = sales_rows["Net Balance YTD"].sum()
 
-            # --- Purchases (P&L 5. Purchase Accounts, debit-heavy → Net Balance negative) ---
-            purch_rows       = _clf(r"5\. Purchase")
-            tb_purchases     = -purch_rows["Net Balance"].sum()       # flip → positive
+            # --- Purchases (matches "5. Purchase Accounts", "Purchase Accounts", etc.) ---
+            purch_rows       = _clf(r"Purchase\s*Account")
+            tb_purchases     = -purch_rows["Net Balance"].sum()       # debit-heavy → flip → positive
             ytd_tb_purchases = -purch_rows["Net Balance YTD"].sum()
 
             # --- Stock (CM) ---
@@ -379,8 +381,8 @@ def parse_financial_excel(
             ytd_purchases = ytd_tb_purchases if ytd_tb_purchases != 0 else ytd_stk_pur
             ytd_cogs      = ytd_opening + ytd_purchases - ytd_closing
 
-            # --- Direct Expenses (P&L 3. Direct Expense) ---
-            dir_rows = _clf(r"3\. Direct")
+            # --- Direct Expenses (matches "3. Direct Expense", "Direct Expense", etc.) ---
+            dir_rows = _clf(r"Direct\s*Expense", exclude=r"Indirect")
             direct_expenses     = -dir_rows["Net Balance"].sum()
             ytd_direct_expenses = -dir_rows["Net Balance YTD"].sum()
             direct_breakdown: dict[str, float] = {}
@@ -395,8 +397,8 @@ def parse_financial_excel(
             gross_profit     = revenue     - cogs     - direct_expenses
             ytd_gross_profit = ytd_revenue - ytd_cogs - ytd_direct_expenses
 
-            # --- Indirect Income (P&L 2. Indirect Income) ---
-            inc_rows = _clf(r"2\. Indirect Income")
+            # --- Indirect Income (matches "2. Indirect Income", "Indirect Income", etc.) ---
+            inc_rows = _clf(r"Indirect\s*Income")
             indirect_income     = inc_rows["Net Balance"].sum()
             ytd_indirect_income = inc_rows["Net Balance YTD"].sum()
             income_breakdown: dict[str, float] = {}
@@ -408,8 +410,9 @@ def parse_financial_excel(
                 if cm_val  != 0: income_breakdown[lname]     = cm_val
                 if ytd_val != 0: ytd_income_breakdown[lname] = ytd_val
 
-            # --- Indirect Expenses (P&L 6. Indirect Expense) ---
-            ind_rows = _clf(r"6\. Indirect")
+            # --- Indirect Expenses (matches "6. Indirect Expense", "Indirect Expense", etc.) ---
+            # Exclude Indirect Income rows so they are not double-counted.
+            ind_rows = _clf(r"Indirect\s*Expense", exclude=r"Indirect\s*Income|Direct")
             indirect_expenses     = -ind_rows["Net Balance"].sum()
             ytd_indirect_expenses = -ind_rows["Net Balance YTD"].sum()
             indirect_breakdown: dict[str, float] = {}
@@ -439,8 +442,10 @@ def parse_financial_excel(
                     "closing_ytd": _s("Closing YTD"),
                 }
 
-            dr_rows = _clf(r"Sundry Debtor")
-            cr_rows = _clf(r"Sundry Creditor")
+            # Keyword-based matching for Debtors/Creditors works for any Tally export
+            # ("Sundry Debtors", "Debtors", "Sundry Debtor" etc.)
+            dr_rows = _clf(r"Debtor")
+            cr_rows = _clf(r"Creditor")
 
             # --- Vertical type ---
             has_revenue = any([revenue, cogs, direct_expenses, ytd_revenue, ytd_cogs, ytd_direct_expenses])

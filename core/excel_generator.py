@@ -19,12 +19,6 @@ from openpyxl.utils import get_column_letter
 # Constants
 # ---------------------------------------------------------------------------
 
-# Preferred column order.  Any vertical NOT in this list is appended at the end.
-PREFERRED_ORDER = [
-    "Bluestreak", "Clarus", "IT", "Factory", "Office", "Common",
-    "Spices - A To Z", "Spices - Vashi",
-]
-
 # Excel number format: positive = comma-formatted; negative = same; zero = dash
 NUM_FMT = '#,##0.00;-#,##0.00;"-"'
 PCT_FMT = '0.00%;-0.00%;"-"'
@@ -76,9 +70,12 @@ def generate_excel_report(report_data: dict) -> str:
     # ------------------------------------------------------------------ #
     # 1.  Build ordered vertical list                                     #
     # ------------------------------------------------------------------ #
-    all_verts = list(report_data["verticals"].keys())
+    # Use the natural vertical order emitted by the parser (first-seen in List of Ledgers).
+    # This preserves the exact column sequence for any company without hardcoding names.
+    all_verts: list[str] = list(report_data["verticals"].keys())
+    vertical_order: list[str] = report_data.get("vertical_order", all_verts)
 
-    # If vertical_types is missing, derive it
+    # Derive vertical_types from data if the parser didn't supply it
     if not vert_types:
         for v, d in report_data["verticals"].items():
             v_lower = v.lower()
@@ -92,14 +89,15 @@ def generate_excel_report(report_data: dict) -> str:
                 vert_types[v] = "revenue"
 
     def _order_key(name: str) -> int:
+        """Sort key based on the parser's natural vertical_order."""
         try:
-            return PREFERRED_ORDER.index(name)
+            return vertical_order.index(name)
         except ValueError:
-            return len(PREFERRED_ORDER)
+            return len(vertical_order)  # unknown verticals go to the end
 
     rev_verts     = sorted([v for v in all_verts if vert_types.get(v) == "revenue"],     key=_order_key)
     cost_centers  = sorted([v for v in all_verts if vert_types.get(v) == "cost_center"], key=_order_key)
-    share_trading = sorted([v for v in all_verts if vert_types.get(v) == "share_trading"])
+    share_trading = sorted([v for v in all_verts if vert_types.get(v) == "share_trading"], key=_order_key)
 
     # Drop Unallocated if empty
     for bucket in [rev_verts, cost_centers, share_trading]:
